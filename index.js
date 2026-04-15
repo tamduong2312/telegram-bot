@@ -6,62 +6,50 @@ const fs = require("fs");
 const app = express();
 app.use(express.json());
 
-// 🔑 Cấu hình biến môi trường (Environment Variables)
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const PAGE_TOKEN = process.env.PAGE_TOKEN;
 const URL = process.env.RENDER_EXTERNAL_URL;
-const PAGE_ID = process.env.PAGE_ID; // Tùy chọn: Dùng để tạo link chuẩn hơn
 
 const bot = new TelegramBot(BOT_TOKEN);
-const DB_FILE = "posts.json";
 
-// 📂 Quản lý dữ liệu file (Lưu ý: Render Free sẽ xóa file khi restart)
-let posts = [];
-if (fs.existsSync(DB_FILE)) {
-  try {
-    posts = JSON.parse(fs.readFileSync(DB_FILE));
-  } catch (e) {
-    posts = [];
-  }
+// 🛒 Bộ nhớ tạm để gom album ảnh
+const mediaGroups = new Map();
+
+// 📌 Hàm đăng Album ảnh lên Facebook
+async function postAlbum(photos, caption) {
+  // Bước 1: Upload từng ảnh lên FB ở chế độ "không hiển thị" (published: false)
+  const uploadedIds = await Promise.all(
+    photos.map(async (url) => {
+      const res = await axios.post(`https://graph.facebook.com/v18.0/me/photos`, {
+        url: url,
+        published: false,
+        access_token: PAGE_TOKEN,
+      });
+      return { media_fbid: res.data.id };
+    })
+  );
+
+  // Bước 2: Gom các ID ảnh lại thành một bài đăng (Feed)
+  const res = await axios.post(`https://graph.facebook.com/v18.0/me/feed`, {
+    message: caption,
+    attached_media: uploadedIds,
+    access_token: PAGE_TOKEN,
+  });
+  
+  return res.data.id;
 }
 
-function savePosts() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(posts, null, 2));
-}
-
-// 📌 Hàm đăng bài lên Facebook (Tự động nhận diện Text hoặc Photo)
-async function postToFacebook(content, photoUrl = null) {
-  let endpoint, data;
-
-  if (photoUrl) {
-    // Đăng ảnh
-    endpoint = `https://graph.facebook.com/v18.0/me/photos`;
-    data = {
-      url: photoUrl,
-      caption: content,
-      access_token: PAGE_TOKEN,
-    };
-  } else {
-    // Đăng text
-    endpoint = `https://graph.facebook.com/v18.0/me/feed`;
-    data = {
-      message: content,
-      access_token: PAGE_TOKEN,
-    };
-  }
+// 📌 Hàm đăng 1 bài đơn (Text hoặc 1 Ảnh) - Giữ lại từ bản trước
+async function postSingle(content, photoUrl = null) {
+  let endpoint = photoUrl ? `https://graph.facebook.com/v18.0/me/photos` : `https://graph.facebook.com/v18.0/me/feed`;
+  let data = photoUrl 
+    ? { url: photoUrl, caption: content, access_token: PAGE_TOKEN }
+    : { message: content, access_token: PAGE_TOKEN };
 
   const res = await axios.post(endpoint, data);
-  return res.data.id || res.data.post_id;
+  return res.data.id;
 }
 
-// 🔍 Hàm tìm kiếm bài viết cũ
-function findPost(keyword) {
-  return posts.find((p) =>
-    p.content.toLowerCase().includes(keyword.toLowerCase())
-  );
-}
-
-// 📡 Thiết lập Webhook
 bot.setWebHook(`${URL}/bot`);
 
 app.post("/bot", async (req, res) => {
@@ -69,67 +57,66 @@ app.post("/bot", async (req, res) => {
   if (!msg) return res.sendStatus(200);
 
   const chatId = msg.chat.id;
-  const text = msg.text || msg.caption || ""; // Lấy text hoặc chú thích ảnh
+  const text = msg.text || msg.caption || "";
+  const mediaGroupId = msg.media_group_id;
 
   try {
-    // 🔹 XỬ LÝ LỆNH TÌM KIẾM & SHARE
-    if (text.toLowerCase().startsWith("share ")) {
-      const keyword = text.replace("share ", "").trim();
-      const post = findPost(keyword);
-
-      if (!post) {
-        await bot.sendMessage(chatId, "❌ Không tìm thấy bài viết nào khớp với từ khóa!");
-      } else {
-        const postUrl = `https://www.facebook.com/${post.id}`;
-        const shareLink = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(postUrl)}`;
-        await bot.sendMessage(
-          chatId,
-          `🔎 Tìm thấy bài:\n"${post.content}"\n\n👉 Link: ${postUrl}\n🔥 Share: ${shareLink}`
-        );
+    // 1. XỬ LÝ ĐĂNG NHIỀU ẢNH (ALBUM)
+    if (mediaGroupId) {
+      if (!mediaGroups.has(mediaGroupId)) {
+        mediaGroups.set(mediaGroupId, {
+          photos: [],
+          caption: text,
+          timer: null
+        });
       }
+
+      const group = mediaGroups.get(mediaGroupId);
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      const photoLink = await bot.getFileLink(fileId);
+      group.photos.push(photoLink);
+      if (text) group.caption = text; // Lấy caption từ ảnh có chứa text
+
+      // Xóa timer cũ, tạo timer mới (đợi 3 giây để gom đủ ảnh)
+      clearTimeout(group.timer);
+      group.timer = setTimeout(async () => {
+        const finalGroup = mediaGroups.get(mediaGroupId);
+        mediaGroups.delete(mediaGroupId); // Xóa khỏi bộ nhớ sau khi xử lý
+
+        try {
+          const postId = await postAlbum(finalGroup.photos, finalGroup.caption);
+          await bot.sendMessage(chatId, `✅ Đã đăng Album (${finalGroup.photos.length} ảnh)!\n🔗 Link: https://www.facebook.com/${postId}`);
+        } catch (e) {
+          console.error(e.response?.data || e.message);
+          await bot.sendMessage(chatId, "❌ Lỗi khi đăng album!");
+        }
+      }, 3000);
+
       return res.sendStatus(200);
     }
 
-    // 🔹 XỬ LÝ ĐĂNG BÀI
-    let postId;
-    
-    if (msg.photo) {
-      // Nếu là ảnh: Lấy ảnh chất lượng cao nhất
-      const fileId = msg.photo[msg.photo.length - 1].file_id;
-      const photoLink = await bot.getFileLink(fileId);
-      postId = await postToFacebook(text, photoLink);
-    } else if (text) {
-      // Nếu là text thuần túy
-      postId = await postToFacebook(text);
+    // 2. XỬ LÝ ĐĂNG 1 ẢNH ĐƠN HOẶC TEXT
+    if (msg.photo || (text && !text.toLowerCase().startsWith("share "))) {
+      let postId;
+      if (msg.photo) {
+        const fileId = msg.photo[msg.photo.length - 1].file_id;
+        const photoLink = await bot.getFileLink(fileId);
+        postId = await postSingle(text, photoLink);
+      } else {
+        postId = await postSingle(text);
+      }
+      
+      if (postId) {
+        await bot.sendMessage(chatId, `✅ Đã đăng thành công!\n🔗 Link: https://www.facebook.com/${postId}`);
+      }
     }
 
-    if (postId) {
-      posts.push({
-        id: postId,
-        content: text || "Hình ảnh",
-        createdAt: new Date(),
-      });
-      savePosts();
-
-      const postUrl = `https://www.facebook.com/${postId}`;
-      const shareLink = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(postUrl)}`;
-
-      await bot.sendMessage(
-        chatId,
-        `✅ Đã đăng lên Facebook!\n\n🔗 Link bài: ${postUrl}\n\n📢 Share nhanh: ${shareLink}`
-      );
-    }
   } catch (err) {
-    console.error("Lỗi API:", err.response?.data || err.message);
-    const errorMsg = err.response?.data?.error?.message || "Không thể kết nối với Facebook.";
-    await bot.sendMessage(chatId, `❌ Lỗi: ${errorMsg}`);
+    console.error(err.response?.data || err.message);
   }
 
   res.sendStatus(200);
 });
 
-// 🌐 Khởi chạy Server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server is running on port " + PORT);
-});
+app.listen(PORT, () => console.log("Server running on port " + PORT));
